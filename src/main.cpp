@@ -1,154 +1,336 @@
-/**
- * Hello World for M5Stack StickS3
- *
- * Initializes M5Unified and displays "Hello World" on the built-in LCD.
- * Also outputs heartbeat messages via USB CDC serial.
- *
- * == Hardware ==
- * The StickS3 uses an ESP32-S3-PICO-1 with:
- *   - 8MB Flash (GD), 8MB PSRAM (AP_3v3)
- *   - 128x128 TFT LCD (ST7789, driven by M5GFX via M5Unified)
- *   - 6-axis IMU (BMI270), RTC (BM8563), Buzzer, IR TX, Button
- *   - Built-in USB-Serial/JTAG (no external USB-UART chip)
- *
- * == Build Configuration (platformio.ini) ==
- *   platform = espressif32@6.12.0
- *   board = esp32-s3-devkitc-1  (no native StickS3 definition exists)
- *   framework = arduino
- *   board_build.arduino.partitions = default_8MB.csv
- *   board_build.arduino.memory_type = qio_opi
- *
- *   build_flags:
- *     -DESP32S3                     → identify chip
- *     -DBOARD_HAS_PSRAM             → enable PSRAM in Arduino layer
- *     -mfix-esp32-psram-cache-issue → workaround ESP32-S3 PSRAM silicon bug
- *     -DCORE_DEBUG_LEVEL=5          → verbose logging
- *     -DARDUINO_USB_CDC_ON_BOOT=1   → Serial maps to USB CDC (not UART0)
- *     -DARDUINO_USB_MODE=1          → hardware CDC (USB-Serial/JTAG)
- *
- * == Known Issues & Workarounds ==
- *
- * 1. USB-Serial/JTAG DTR/reset behavior:
- *    On the StickS3 (ESP32-S3-PICO-1), asserting DTR (setting it LOW) puts
- *    the chip into DOWNLOAD mode regardless of RTS state.  The Linux CDC ACM
- *    driver asserts DTR EVERY time /dev/ttyACM0 is opened.  This creates a
- *    chicken-and-egg problem:
- *      - Opening the serial port to read output → DTR asserted → chip resets
- *        → ROM bootloader enters download mode → firmware stops running.
- *
- *    WORKAROUND: After PlatformIO flashes the firmware and does "Hard resetting
- *    via RTS pin", the chip may be stuck in download mode.  To run the firmware:
- *      a) Physically unplug and replug the USB-C cable (power cycle).
- *         The chip boots without DTR assertion and runs the firmware normally.
- *      b) After the firmware is running (LCD shows "Hello World"), you can
- *         safely open /dev/ttyACM0 — the firmware's Serial.begin() prevents
- *         the ROM-level DTR reset from re-triggering.
- *
- *    If you use `pio device monitor`, it opens the port and triggers the
- *    reset.  Use an external terminal (screen, minicom, picocom) AFTER
- *    power-cycling the board.
- *
- * 2. HWCDC::begin() does NOT deinit the ROM's USB configuration:
- *    In Arduino-ESP32 3.x (framework-arduinoespressif32 @ 3.20017.241212),
- *    HWCDC::begin() has the `deinit()` call commented out.  This means the
- *    USB device never re-enumerates after the ROM bootloader hands over to
- *    the firmware.  The host may keep stale CDC endpoint configuration.
- *
- *    WORKAROUND: Directly manipulate the USB_SERIAL_JTAG registers to
- *    force a USB disconnect/reconnect before initializing serial.
- *    - Set dp_pullup=0 + usb_pad_enable=0 → host sees disconnect
- *    - Delay 200ms
- *    - Set dp_pullup=1 + usb_pad_enable=1 → host sees new device → re-enumerates
- *    HWCDC::deinit() doesn't work for this because pinMode() can't
- *    override the USB PHY when usb_pad_enable is set.
- *
- * 3. PSRAM board definition mismatch:
- *    The esp32-s3-devkitc-1 board is defined as "No PSRAM" in PlatformIO,
- *    but the StickS3 has 8MB PSRAM.  The -DBOARD_HAS_PSRAM flag tells the
- *    Arduino layer to use PSRAM, but the underlying ESP-IDF sdkconfig may
- *    still have PSRAM disabled.  This appears to work in practice (the PSRAM
- *    is detected by esptool and the firmware boots), but be aware of the
- *    potential mismatch.
- */
-
 #include <M5Unified.h>
-// For direct USB_SERIAL_JTAG register access (force USB re-enumeration)
 #include "hal/usb_serial_jtag_ll.h"
 
-void setup() {
-  // == Step 1: Force USB re-enumeration at the register level ==
-  // The ROM bootloader leaves the USB-Serial/JTAG peripheral configured.
-  // HWCDC::begin() does NOT trigger a USB reset (its deinit() is commented
-  // out).  We force a disconnect by clearing the D+ pullup and disabling the
-  // USB pad via direct register writes.  The host sees a disconnect; when we
-  // re-enable, it sees a new connection and properly enumerates the CDC ACM
-  // interface under firmware control.
-  USB_SERIAL_JTAG.conf0.dp_pullup = 0;      // D+ pullup off → disconnect
-  USB_SERIAL_JTAG.conf0.usb_pad_enable = 0; // USB pad off
+namespace {
+
+constexpr int kScreenW = 128;
+constexpr int kScreenH = 128;
+constexpr int kPanelTop = 92;
+constexpr int kTreeLeft = 8;
+constexpr int kTreeRight = 120;
+constexpr int kMaxDepth = 4;
+constexpr int kLeafSlots = 1 << kMaxDepth;
+constexpr uint32_t kLongPressMs = 380;
+constexpr uint32_t kIdleResetMs = 2200;
+constexpr uint32_t kFlashMs = 700;
+
+struct MorseEntry {
+  char letter;
+  const char* code;
+};
+
+struct TreeNode {
+  bool occupied = false;
+  char letter = '\0';
+};
+
+constexpr MorseEntry kAlphabet[] = {
+    {'A', ".-"},   {'B', "-..."}, {'C', "-.-."}, {'D', "-.."},
+    {'E', "."},    {'F', "..-."}, {'G', "--."},  {'H', "...."},
+    {'I', ".."},   {'J', ".---"}, {'K', "-.-"},  {'L', ".-.."},
+    {'M', "--"},   {'N', "-."},   {'O', "---"},  {'P', ".--."},
+    {'Q', "--.-"}, {'R', ".-."},  {'S', "..."},  {'T', "-"},
+    {'U', "..-"},  {'V', "...-"}, {'W', ".--"},  {'X', "-..-"},
+    {'Y', "-.--"}, {'Z', "--.."},
+};
+
+TreeNode g_tree[1 << (kMaxDepth + 1)];
+int g_currentIndex = 1;
+bool g_buttonDown = false;
+uint32_t g_buttonDownAt = 0;
+uint32_t g_lastActionAt = 0;
+uint32_t g_flashUntil = 0;
+bool g_lastMoveValid = true;
+const char* g_flashText = "Ready";
+
+int childIndex(int node, bool goLeft) {
+  return node * 2 + (goLeft ? 0 : 1);
+}
+
+int nodeDepth(int index) {
+  int depth = 0;
+  while (index > 1) {
+    index /= 2;
+    ++depth;
+  }
+  return depth;
+}
+
+int nodeBits(int index) {
+  int depth = nodeDepth(index);
+  return index - (1 << depth);
+}
+
+float nodeX(int index) {
+  int depth = nodeDepth(index);
+  int bits = nodeBits(index);
+  int width = 1 << (kMaxDepth - depth);
+  float center = bits * width + width * 0.5f;
+  float span = static_cast<float>(kTreeRight - kTreeLeft);
+  return kTreeLeft + span * (center / kLeafSlots);
+}
+
+float nodeY(int index) {
+  int depth = nodeDepth(index);
+  return 12.0f + depth * 18.0f;
+}
+
+bool hasNode(int index) {
+  return index < static_cast<int>(sizeof(g_tree) / sizeof(g_tree[0])) &&
+         g_tree[index].occupied;
+}
+
+const char* letterText(int index) {
+  if (!hasNode(index)) {
+    return "--";
+  }
+  if (index == 1) {
+    return "ROOT";
+  }
+  static char buf[2];
+  buf[0] = g_tree[index].letter ? g_tree[index].letter : '*';
+  buf[1] = '\0';
+  return buf;
+}
+
+void markPath(int index, char* out) {
+  int depth = nodeDepth(index);
+  out[depth] = '\0';
+  while (depth > 0) {
+    out[depth - 1] = (index % 2 == 0) ? '-' : '.';
+    index /= 2;
+    --depth;
+  }
+}
+
+void buildTree() {
+  g_tree[1].occupied = true;
+  for (const auto& entry : kAlphabet) {
+    int index = 1;
+    g_tree[index].occupied = true;
+    for (const char* p = entry.code; *p; ++p) {
+      index = childIndex(index, *p == '-');
+      g_tree[index].occupied = true;
+    }
+    g_tree[index].letter = entry.letter;
+  }
+}
+
+void forceUsbReenumeration() {
+  USB_SERIAL_JTAG.conf0.dp_pullup = 0;
+  USB_SERIAL_JTAG.conf0.usb_pad_enable = 0;
   delay(200);
-  USB_SERIAL_JTAG.conf0.dp_pullup = 1;      // D+ pullup on → host sees connect
-  USB_SERIAL_JTAG.conf0.usb_pad_enable = 1; // USB pad on
-  delay(200);                                // Host enumerates
+  USB_SERIAL_JTAG.conf0.dp_pullup = 1;
+  USB_SERIAL_JTAG.conf0.usb_pad_enable = 1;
+  delay(200);
+}
 
-  // == Step 2: Initialize serial ==
+void showFlash(const char* text, bool valid) {
+  g_flashText = text;
+  g_lastMoveValid = valid;
+  g_flashUntil = millis() + kFlashMs;
+}
+
+void drawHeader() {
+  M5.Lcd.setTextDatum(top_center);
+  M5.Lcd.setTextSize(1);
+  M5.Lcd.setTextColor(0xFFE0, TFT_BLACK);
+  M5.Lcd.drawString("Morse Tree Trainer", kScreenW / 2, 1);
+  M5.Lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+  M5.Lcd.drawString("Long = left / Short = right", kScreenW / 2, 10);
+}
+
+void drawConnections() {
+  for (int index = 1; index < 16; ++index) {
+    if (!hasNode(index)) {
+      continue;
+    }
+    int left = childIndex(index, true);
+    int right = childIndex(index, false);
+    float x1 = nodeX(index);
+    float y1 = nodeY(index);
+    if (hasNode(left)) {
+      M5.Lcd.drawLine(static_cast<int>(x1), static_cast<int>(y1),
+                      static_cast<int>(nodeX(left)), static_cast<int>(nodeY(left)),
+                      TFT_DARKGREY);
+    }
+    if (hasNode(right)) {
+      M5.Lcd.drawLine(static_cast<int>(x1), static_cast<int>(y1),
+                      static_cast<int>(nodeX(right)), static_cast<int>(nodeY(right)),
+                      TFT_DARKGREY);
+    }
+  }
+}
+
+void drawNodes() {
+  for (int index = 1; index < 32; ++index) {
+    if (!hasNode(index)) {
+      continue;
+    }
+
+    int x = static_cast<int>(nodeX(index));
+    int y = static_cast<int>(nodeY(index));
+    bool active = (index == g_currentIndex);
+    bool onPath = false;
+    for (int probe = g_currentIndex; probe >= 1; probe /= 2) {
+      if (probe == index) {
+        onPath = true;
+        break;
+      }
+    }
+
+    uint16_t fill = TFT_BLACK;
+    uint16_t ring = TFT_DARKGREY;
+    uint16_t text = TFT_WHITE;
+    int radius = 5;
+
+    if (index == 1) {
+      fill = 0x18C3;
+      text = TFT_CYAN;
+    }
+    if (onPath) {
+      ring = 0x7BEF;
+    }
+    if (active) {
+      fill = 0xFD20;
+      ring = TFT_WHITE;
+      text = TFT_BLACK;
+      radius = 6;
+    }
+
+    M5.Lcd.fillCircle(x, y, radius, fill);
+    M5.Lcd.drawCircle(x, y, radius, ring);
+
+    if (g_tree[index].letter) {
+      char label[2] = {g_tree[index].letter, '\0'};
+      M5.Lcd.setTextDatum(middle_center);
+      M5.Lcd.setTextColor(text, fill);
+      M5.Lcd.drawString(label, x, y + 1);
+    } else if (index == 1) {
+      M5.Lcd.setTextDatum(middle_center);
+      M5.Lcd.setTextColor(text, fill);
+      M5.Lcd.drawString("*", x, y + 1);
+    }
+  }
+}
+
+void drawPanel() {
+  char path[8];
+  markPath(g_currentIndex, path);
+
+  int left = childIndex(g_currentIndex, true);
+  int right = childIndex(g_currentIndex, false);
+
+  M5.Lcd.fillRoundRect(4, kPanelTop, 120, 32, 6, 0x1061);
+  M5.Lcd.drawRoundRect(4, kPanelTop, 120, 32, 6, 0x39E7);
+
+  M5.Lcd.setTextDatum(top_left);
+  M5.Lcd.setTextSize(1);
+  M5.Lcd.setTextColor(TFT_WHITE, 0x1061);
+  M5.Lcd.setCursor(8, kPanelTop + 4);
+  M5.Lcd.printf("Path:%s", path[0] ? path : " root");
+
+  M5.Lcd.setTextColor(0xFFE0, 0x1061);
+  M5.Lcd.setCursor(8, kPanelTop + 14);
+  if (g_currentIndex == 1) {
+    M5.Lcd.print("Current: start");
+  } else if (g_tree[g_currentIndex].letter) {
+    M5.Lcd.printf("Current: %c", g_tree[g_currentIndex].letter);
+  } else {
+    M5.Lcd.print("Current: branch");
+  }
+
+  M5.Lcd.setTextColor(TFT_CYAN, 0x1061);
+  M5.Lcd.setCursor(8, kPanelTop + 24);
+  M5.Lcd.printf("L:%s  R:%s", letterText(left), letterText(right));
+
+  uint16_t flashColor = g_lastMoveValid ? TFT_GREEN : TFT_RED;
+  if (millis() < g_flashUntil) {
+    M5.Lcd.setTextDatum(top_right);
+    M5.Lcd.setTextColor(flashColor, 0x1061);
+    M5.Lcd.drawString(g_flashText, 120, kPanelTop + 4);
+  }
+}
+
+void renderUi() {
+  M5.Lcd.startWrite();
+  M5.Lcd.fillScreen(TFT_BLACK);
+  drawHeader();
+  drawConnections();
+  drawNodes();
+  drawPanel();
+  M5.Lcd.endWrite();
+}
+
+void setLedForDepth() {
+  int depth = nodeDepth(g_currentIndex);
+  M5.Power.setLed(depth > 0 ? 1 : 0);
+}
+
+void moveSelection(bool goLeft) {
+  int next = childIndex(g_currentIndex, goLeft);
+  if (hasNode(next)) {
+    g_currentIndex = next;
+    g_lastActionAt = millis();
+    showFlash(goLeft ? "Long -> left" : "Short -> right", true);
+  } else {
+    showFlash("No branch", false);
+  }
+  setLedForDepth();
+  renderUi();
+}
+
+void resetToRoot(const char* reason) {
+  g_currentIndex = 1;
+  g_lastActionAt = millis();
+  showFlash(reason, true);
+  setLedForDepth();
+  renderUi();
+}
+
+void handleButton() {
+  bool pressed = M5.BtnA.isPressed();
+  uint32_t now = millis();
+
+  if (pressed && !g_buttonDown) {
+    g_buttonDown = true;
+    g_buttonDownAt = now;
+  } else if (!pressed && g_buttonDown) {
+    uint32_t duration = now - g_buttonDownAt;
+    g_buttonDown = false;
+    moveSelection(duration >= kLongPressMs);
+  }
+}
+
+void handleIdleReset() {
+  if (g_currentIndex != 1 && millis() - g_lastActionAt > kIdleResetMs) {
+    resetToRoot("Auto reset");
+  }
+}
+
+}  // namespace
+
+void setup() {
+  forceUsbReenumeration();
+
   Serial.begin(115200);
-  // Use a timed delay rather than `while(!Serial)` because on hardware CDC
-  // the connection flag may already be true before the host opens the port.
-  delay(2000);
+  delay(1200);
+  Serial.println("\n=== StickS3 Morse Trainer ===");
 
-  Serial.println("\n\n=== M5Stack StickS3 Hello World ===");
-  Serial.println("Board:  StickS3 (ESP32-S3-PICO-1)");
-  Serial.println("Chip:   ESP32-S3 rev v0.2");
-  Serial.println("Flash:  8MB (GD QIO)");
-  Serial.println("PSRAM:  8MB (AP_3v3 OPI)");
-  Serial.println("LCD:    128x128 TFT (ST7789)");
-  Serial.println("USB:    HW CDC (USB-Serial/JTAG)");
-  Serial.println("==================================\n");
-  Serial.println("Initializing M5Unified...");
-
-  // == Step 3: Initialize M5Unified ==
   auto cfg = M5.config();
   cfg.serial_baudrate = 115200;
   M5.begin(cfg);
 
-  Serial.println("M5Unified initialized successfully.");
-
-  // == Step 4: LCD display ==
-  M5.Lcd.fillScreen(TFT_BLACK);
-  M5.Lcd.setTextColor(TFT_WHITE);
-  M5.Lcd.setTextSize(2);
-  M5.Lcd.setCursor(10, 40);
-  M5.Lcd.println("Hello");
-  M5.Lcd.setCursor(10, 70);
-  M5.Lcd.println("World!");
-
-  // Footer
-  M5.Lcd.setTextSize(1);
-  M5.Lcd.setTextColor(TFT_GREEN);
-  M5.Lcd.setCursor(10, 110);
-  M5.Lcd.println("StickS3 Ready.");
-
-  Serial.println("Display updated. Setup complete.\n");
+  buildTree();
+  g_lastActionAt = millis();
+  showFlash("Ready", true);
+  setLedForDepth();
+  renderUi();
 }
 
 void loop() {
-  static unsigned long last_toggle = 0;
-  static bool led_state = false;
-
-  unsigned long now = millis();
-  if (now - last_toggle >= 1000) {
-    last_toggle = now;
-    led_state = !led_state;
-
-    // Toggle power LED (green)
-    M5.Power.setLed(led_state ? 1 : 0);
-
-    static unsigned long beat_count = 0;
-    Serial.printf("Heartbeat #%lu — LED %s\n",
-                  ++beat_count,
-                  led_state ? "ON" : "OFF");
-  }
-
   M5.update();
+  handleButton();
+  handleIdleReset();
   delay(10);
 }
