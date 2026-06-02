@@ -1,106 +1,164 @@
+/**
+ * Morse Code Trainer for M5Stack StickS3
+ *
+ * A binary-tree based Morse code learning tool optimized for the
+ * StickS3's 128×128 pixel LCD.
+ *
+ * StickS3 display notes (from official M5Unified HowToUse example):
+ * - The ST7789 panel is 135×240; the visible lens is 128×128
+ * - setRotation(1) gives landscape orientation (logical 240×135)
+ * - M5GFX applies internal offsets (52, 40) to center the 128×128
+ *   viewport within the panel
+ * - Effective drawable area: (0,0) to (127,127) in user coordinates
+ * - Text size formula from official example:
+ *     textsize = M5.Display.height() / 160 (→ 1 for StickS3)
+ *   This is too small for dense UI; we use textsize=2 for readability
+ *
+ * Controls:
+ *   Short press (< 380 ms):  Dot (left tree branch)
+ *   Long press  (≥ 380 ms):  Dash (right tree branch)
+ *   Auto-reset after 2200 ms of inactivity
+ */
+
 #include <M5Unified.h>
 #include "hal/usb_serial_jtag_ll.h"
 
 namespace {
 
+// ── Display ────────────────────────────────────────────────────────
 constexpr int kScreenW = 128;
 constexpr int kScreenH = 128;
-constexpr int kPanelTop = 92;
-constexpr int kTreeLeft = 8;
-constexpr int kTreeRight = 120;
-constexpr int kMaxDepth = 4;
-constexpr int kLeafSlots = 1 << kMaxDepth;
-constexpr uint32_t kLongPressMs = 380;
-constexpr uint32_t kIdleResetMs = 2200;
-constexpr uint32_t kFlashMs = 700;
+constexpr uint8_t kDisplayRotation = 1;  // landscape per official example
+constexpr int kTextSize = 2;             // readable on 128×128
 
+// ── Tree ───────────────────────────────────────────────────────────
+constexpr int kMaxDepth = 4;             // 4 levels = 31 nodes max
+constexpr int kMaxNodes = 31;
+
+// ── Timing (ms) ────────────────────────────────────────────────────
+constexpr uint32_t kLongPressMs  = 380;
+constexpr uint32_t kIdleResetMs  = 2200;
+constexpr uint32_t kFlashMs      = 700;
+constexpr uint32_t kDotMs        = 90;
+constexpr uint32_t kDashMs       = 270;
+constexpr float    kToneHz       = 880.0f;
+
+// ── Colors (RGB565) ────────────────────────────────────────────────
+constexpr uint16_t kBg          = 0x10A4;
+constexpr uint16_t kTrace       = 0xEF7D;
+constexpr uint16_t kTraceActive = 0x06FF;
+constexpr uint16_t kNodeFill    = 0x18E7;
+constexpr uint16_t kNodeActive  = 0xFD20;
+constexpr uint16_t kTextWhite   = TFT_WHITE;
+constexpr uint16_t kTextDim     = 0xC638;
+
+// ── Data ───────────────────────────────────────────────────────────
 struct MorseEntry {
   char letter;
   const char* code;
 };
 
+constexpr MorseEntry kAlphabet[] = {
+  {'A', ".-"},   {'B', "-..."}, {'C', "-.-."}, {'D', "-.."},
+  {'E', "."},    {'F', "..-."}, {'G', "--."},  {'H', "...."},
+  {'I', ".."},   {'J', ".---"}, {'K', "-.-"},  {'L', ".-.."},
+  {'M', "--"},   {'N', "-."},   {'O', "---"},  {'P', ".--."},
+  {'Q', "--.-"}, {'R', ".-."},  {'S', "..."},  {'T', "-"},
+  {'U', "..-"},  {'V', "...-"}, {'W', ".--"},  {'X', "-..-"},
+  {'Y', "-.--"}, {'Z', "--.."},
+};
+
 struct TreeNode {
   bool occupied = false;
-  char letter = '\0';
+  char letter   = '\0';
 };
 
-constexpr MorseEntry kAlphabet[] = {
-    {'A', ".-"},   {'B', "-..."}, {'C', "-.-."}, {'D', "-.."},
-    {'E', "."},    {'F', "..-."}, {'G', "--."},  {'H', "...."},
-    {'I', ".."},   {'J', ".---"}, {'K', "-.-"},  {'L', ".-.."},
-    {'M', "--"},   {'N', "-."},   {'O', "---"},  {'P', ".--."},
-    {'Q', "--.-"}, {'R', ".-."},  {'S', "..."},  {'T', "-"},
-    {'U', "..-"},  {'V', "...-"}, {'W', ".--"},  {'X', "-..-"},
-    {'Y', "-.--"}, {'Z', "--.."},
+// Node positions on 128×128 grid — arranged for full-screen tree
+// Index = heap index (root=1, left=idx*2, right=idx*2+1)
+struct NodeVisual {
+  int16_t x;
+  int16_t y;
 };
 
+// 4-level binary tree layout using the FULL 128×128 area
+// Level 0 (root):     1 node  at y=102
+// Level 1:            2 nodes at y=80
+// Level 2:            4 nodes at y=56
+// Level 3:            8 nodes at y=28
+// Level 4 (leaves):  16 nodes at y=6  (just dots, no circles)
+// Total: 31 positions
+constexpr NodeVisual kLayout[32] = {
+  // idx 0 (unused)
+  {0,   0},
+  // L0: root
+  {64, 115},
+  // L1: 2 nodes
+  {36, 92}, {92, 92},
+  // L2: 4 nodes
+  {20, 66},  {52, 66},  {76, 66},  {108, 66},
+  // L3: 8 nodes
+  {12, 38},  {28, 38},  {40, 38},  {64, 38},
+  {76, 38},  {92, 38},  {104, 38}, {116, 38},
+  // L4: 16 leaf positions (labels only, no circles)
+  {6,   8},  {14,  8},  {22,  8},  {31,  8},
+  {41,  8},  {48,  8},  {56,  8},  {64,  8},
+  {73,  8},  {80,  8},  {87,  8},  {96,  8},
+  {105, 8},  {112, 8},  {118, 8},  {124, 8},
+};
+
+// ── State ──────────────────────────────────────────────────────────
 TreeNode g_tree[1 << (kMaxDepth + 1)];
-int g_currentIndex = 1;
-bool g_buttonDown = false;
+int      g_currentIndex = 1;
+bool     g_buttonDown   = false;
 uint32_t g_buttonDownAt = 0;
 uint32_t g_lastActionAt = 0;
-uint32_t g_flashUntil = 0;
-bool g_lastMoveValid = true;
+uint32_t g_flashUntil   = 0;
+bool     g_lastMoveValid = true;
 const char* g_flashText = "Ready";
 
+// ── Helpers ────────────────────────────────────────────────────────
 int childIndex(int node, bool goLeft) {
   return node * 2 + (goLeft ? 0 : 1);
 }
 
 int nodeDepth(int index) {
-  int depth = 0;
-  while (index > 1) {
-    index /= 2;
-    ++depth;
-  }
-  return depth;
-}
-
-int nodeBits(int index) {
-  int depth = nodeDepth(index);
-  return index - (1 << depth);
-}
-
-float nodeX(int index) {
-  int depth = nodeDepth(index);
-  int bits = nodeBits(index);
-  int width = 1 << (kMaxDepth - depth);
-  float center = bits * width + width * 0.5f;
-  float span = static_cast<float>(kTreeRight - kTreeLeft);
-  return kTreeLeft + span * (center / kLeafSlots);
-}
-
-float nodeY(int index) {
-  int depth = nodeDepth(index);
-  return 12.0f + depth * 18.0f;
+  int d = 0;
+  while (index > 1) { index /= 2; ++d; }
+  return d;
 }
 
 bool hasNode(int index) {
-  return index < static_cast<int>(sizeof(g_tree) / sizeof(g_tree[0])) &&
-         g_tree[index].occupied;
+  return index > 0 && index <= kMaxNodes && g_tree[index].occupied;
 }
 
-const char* letterText(int index) {
-  if (!hasNode(index)) {
-    return "--";
+bool isOnCurrentPath(int index) {
+  for (int probe = g_currentIndex; probe >= 1; probe /= 2) {
+    if (probe == index) return true;
   }
-  if (index == 1) {
-    return "ROOT";
-  }
-  static char buf[2];
-  buf[0] = g_tree[index].letter ? g_tree[index].letter : '*';
-  buf[1] = '\0';
-  return buf;
+  return false;
 }
 
 void markPath(int index, char* out) {
-  int depth = nodeDepth(index);
-  out[depth] = '\0';
-  while (depth > 0) {
-    out[depth - 1] = (index % 2 == 0) ? '-' : '.';
-    index /= 2;
-    --depth;
+  int d = nodeDepth(index);
+  out[d] = '\0';
+  while (d > 0) {
+    out[d - 1] = (index % 2 == 0) ? '-' : '.';
+    index /= 2; --d;
   }
+}
+
+const char* codeText(int index) {
+  static char path[8];
+  if (index == 1) return "*";
+  markPath(index, path);
+  return path;
+}
+
+const char* nodeLabel(int index) {
+  static char label[2];
+  label[0] = g_tree[index].letter ? g_tree[index].letter : '*';
+  label[1] = '\0';
+  return label;
 }
 
 void buildTree() {
@@ -116,7 +174,10 @@ void buildTree() {
   }
 }
 
-void forceUsbReenumeration() {
+}  // namespace
+
+// ── Hardware setup ─────────────────────────────────────────────────────
+static void forceUsbReenumeration() {
   USB_SERIAL_JTAG.conf0.dp_pullup = 0;
   USB_SERIAL_JTAG.conf0.usb_pad_enable = 0;
   delay(200);
@@ -125,176 +186,177 @@ void forceUsbReenumeration() {
   delay(200);
 }
 
-void showFlash(const char* text, bool valid) {
-  g_flashText = text;
+// ── Audio / feedback ───────────────────────────────────────────────────
+static void showFlash(const char* text, bool valid) {
+  g_flashText    = text;
   g_lastMoveValid = valid;
-  g_flashUntil = millis() + kFlashMs;
+  g_flashUntil    = millis() + kFlashMs;
 }
 
-void drawHeader() {
-  M5.Lcd.setTextDatum(top_center);
-  M5.Lcd.setTextSize(1);
-  M5.Lcd.setTextColor(0xFFE0, TFT_BLACK);
-  M5.Lcd.drawString("Morse Tree Trainer", kScreenW / 2, 1);
-  M5.Lcd.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-  M5.Lcd.drawString("Long = left / Short = right", kScreenW / 2, 10);
+static void playElementTone(bool dash) {
+  M5.Speaker.tone(kToneHz, dash ? kDashMs : kDotMs);
 }
 
-void drawConnections() {
-  for (int index = 1; index < 16; ++index) {
-    if (!hasNode(index)) {
-      continue;
-    }
-    int left = childIndex(index, true);
+// ── Drawing ────────────────────────────────────────────────────────────
+static void drawSegment(int x0, int y0, int x1, int y1, uint16_t c) {
+  // 2px thick lines for visibility on small screen
+  M5.Display.drawLine(x0, y0, x1, y1, c);
+  M5.Display.drawLine(x0 + 1, y0, x1 + 1, y1, c);
+}
+
+static void drawConnection(int parent, int child, uint16_t color) {
+  const auto& p = kLayout[parent];
+  const auto& c = kLayout[child];
+  int midY = (p.y + c.y) / 2;
+  drawSegment(p.x, p.y, p.x, midY, color);
+  drawSegment(p.x, midY, c.x, midY, color);
+  drawSegment(c.x, midY, c.x, c.y, color);
+}
+
+static void drawBoardFrame() {
+  // Full-screen rounded border using all 128×128 pixels
+  M5.Display.fillRoundRect(1, 1, 126, 126, 14, kBg);
+  M5.Display.drawRoundRect(1, 1, 126, 126, 14, 0xBDF7);
+}
+
+static void drawHeader() {
+  // Compact header: minimal height, centered at top
+  M5.Display.setTextSize(1);
+  M5.Display.setTextDatum(top_center);
+  M5.Display.setTextColor(kTextDim, kBg);
+  M5.Display.drawString("MORSE   Dash=long  Dot=short", 64, 4);
+}
+
+static void drawTraces() {
+  for (int index = 1; index <= 15; ++index) {
+    if (!hasNode(index)) continue;
+    int left  = childIndex(index, true);
     int right = childIndex(index, false);
-    float x1 = nodeX(index);
-    float y1 = nodeY(index);
-    if (hasNode(left)) {
-      M5.Lcd.drawLine(static_cast<int>(x1), static_cast<int>(y1),
-                      static_cast<int>(nodeX(left)), static_cast<int>(nodeY(left)),
-                      TFT_DARKGREY);
-    }
-    if (hasNode(right)) {
-      M5.Lcd.drawLine(static_cast<int>(x1), static_cast<int>(y1),
-                      static_cast<int>(nodeX(right)), static_cast<int>(nodeY(right)),
-                      TFT_DARKGREY);
-    }
+    if (hasNode(left))  drawConnection(index, left,  isOnCurrentPath(left)  ? kTraceActive : kTrace);
+    if (hasNode(right)) drawConnection(index, right, isOnCurrentPath(right) ? kTraceActive : kTrace);
   }
 }
 
-void drawNodes() {
-  for (int index = 1; index < 32; ++index) {
-    if (!hasNode(index)) {
-      continue;
-    }
+static void drawNode(int index) {
+  if (!hasNode(index)) return;
+  bool isLeaf = nodeDepth(index) >= kMaxDepth;
 
-    int x = static_cast<int>(nodeX(index));
-    int y = static_cast<int>(nodeY(index));
-    bool active = (index == g_currentIndex);
-    bool onPath = false;
-    for (int probe = g_currentIndex; probe >= 1; probe /= 2) {
-      if (probe == index) {
-        onPath = true;
-        break;
-      }
-    }
+  const auto& n = kLayout[index];
+  bool active = (index == g_currentIndex);
+  bool path   = isOnCurrentPath(index);
 
-    uint16_t fill = TFT_BLACK;
-    uint16_t ring = TFT_DARKGREY;
-    uint16_t text = TFT_WHITE;
-    int radius = 5;
-
-    if (index == 1) {
-      fill = 0x18C3;
-      text = TFT_CYAN;
-    }
-    if (onPath) {
-      ring = 0x7BEF;
-    }
+  if (isLeaf) {
+    // Leaves: just the letter label, no circle (saves space)
+    M5.Display.setTextSize(1);
+    M5.Display.setTextDatum(middle_center);
     if (active) {
-      fill = 0xFD20;
-      ring = TFT_WHITE;
-      text = TFT_BLACK;
-      radius = 6;
+      M5.Display.setTextColor(kNodeActive, kBg);
+    } else {
+      M5.Display.setTextColor(path ? kTraceActive : kTrace, kBg);
     }
+    M5.Display.drawString(nodeLabel(index), n.x, n.y);
+  } else {
+    // Internal nodes: filled circle + label
+    int r = active ? 6 : 5;
+    uint16_t fill = active ? kNodeActive : kNodeFill;
+    uint16_t ring = active ? TFT_WHITE : (path ? kTraceActive : kTrace);
 
-    M5.Lcd.fillCircle(x, y, radius, fill);
-    M5.Lcd.drawCircle(x, y, radius, ring);
+    M5.Display.fillCircle(n.x, n.y, r, fill);
+    M5.Display.drawCircle(n.x, n.y, r, ring);
 
-    if (g_tree[index].letter) {
-      char label[2] = {g_tree[index].letter, '\0'};
-      M5.Lcd.setTextDatum(middle_center);
-      M5.Lcd.setTextColor(text, fill);
-      M5.Lcd.drawString(label, x, y + 1);
-    } else if (index == 1) {
-      M5.Lcd.setTextDatum(middle_center);
-      M5.Lcd.setTextColor(text, fill);
-      M5.Lcd.drawString("*", x, y + 1);
-    }
+    // Label inside circle
+    M5.Display.setTextSize(1);
+    M5.Display.setTextDatum(middle_center);
+    M5.Display.setTextColor(active ? TFT_BLACK : kTextWhite, fill);
+    M5.Display.drawString(nodeLabel(index), n.x, n.y);
   }
 }
 
-void drawPanel() {
+static void drawNodes() {
+  for (int index = 1; index <= kMaxNodes; ++index) drawNode(index);
+}
+
+static void drawStatusBar() {
   char path[8];
   markPath(g_currentIndex, path);
-
-  int left = childIndex(g_currentIndex, true);
+  int left  = childIndex(g_currentIndex, true);
   int right = childIndex(g_currentIndex, false);
 
-  M5.Lcd.fillRoundRect(4, kPanelTop, 120, 32, 6, 0x1061);
-  M5.Lcd.drawRoundRect(4, kPanelTop, 120, 32, 6, 0x39E7);
+  // Status bar at very bottom of screen
+  int barY = kScreenH - 10;
+  M5.Display.fillRoundRect(4, barY, 120, 9, 4, 0x18C6);
+  M5.Display.drawRoundRect(4, barY, 120, 9, 4, 0x7BEF);
 
-  M5.Lcd.setTextDatum(top_left);
-  M5.Lcd.setTextSize(1);
-  M5.Lcd.setTextColor(TFT_WHITE, 0x1061);
-  M5.Lcd.setCursor(8, kPanelTop + 4);
-  M5.Lcd.printf("Path:%s", path[0] ? path : " root");
-
-  M5.Lcd.setTextColor(0xFFE0, 0x1061);
-  M5.Lcd.setCursor(8, kPanelTop + 14);
+  // Current code (left side)
+  M5.Display.setTextSize(1);
+  M5.Display.setTextDatum(top_left);
+  M5.Display.setTextColor(kTextWhite, 0x18C6);
+  M5.Display.setCursor(7, barY + 1);
   if (g_currentIndex == 1) {
-    M5.Lcd.print("Current: start");
+    M5.Display.print("*");
   } else if (g_tree[g_currentIndex].letter) {
-    M5.Lcd.printf("Current: %c", g_tree[g_currentIndex].letter);
+    M5.Display.printf("%c %s", g_tree[g_currentIndex].letter, path);
   } else {
-    M5.Lcd.print("Current: branch");
+    M5.Display.printf("%s", path);
   }
 
-  M5.Lcd.setTextColor(TFT_CYAN, 0x1061);
-  M5.Lcd.setCursor(8, kPanelTop + 24);
-  M5.Lcd.printf("L:%s  R:%s", letterText(left), letterText(right));
+  // Available branches (center)
+  M5.Display.setTextColor(kTextDim, 0x18C6);
+  M5.Display.setTextDatum(top_center);
+  M5.Display.drawString(
+    (String("-") + (hasNode(left)  ? nodeLabel(left)  : "_") +
+     "  ."  + (hasNode(right) ? nodeLabel(right) : "_")).c_str(),
+    80, barY + 1);
 
-  uint16_t flashColor = g_lastMoveValid ? TFT_GREEN : TFT_RED;
+  // Flash feedback (right side)
   if (millis() < g_flashUntil) {
-    M5.Lcd.setTextDatum(top_right);
-    M5.Lcd.setTextColor(flashColor, 0x1061);
-    M5.Lcd.drawString(g_flashText, 120, kPanelTop + 4);
+    M5.Display.setTextDatum(top_right);
+    M5.Display.setTextColor(g_lastMoveValid ? TFT_GREEN : TFT_RED, 0x18C6);
+    M5.Display.drawString(g_flashText, 122, barY + 1);
   }
 }
 
-void renderUi() {
-  M5.Lcd.startWrite();
-  M5.Lcd.fillScreen(TFT_BLACK);
+static void renderUi() {
+  M5.Display.startWrite();
+  M5.Display.fillScreen(TFT_BLACK);
+  drawBoardFrame();
   drawHeader();
-  drawConnections();
+  drawTraces();
   drawNodes();
-  drawPanel();
-  M5.Lcd.endWrite();
+  drawStatusBar();
+  M5.Display.endWrite();
 }
 
-void setLedForDepth() {
-  int depth = nodeDepth(g_currentIndex);
-  M5.Power.setLed(depth > 0 ? 1 : 0);
-}
-
-void moveSelection(bool goLeft) {
+// ── Input handling ─────────────────────────────────────────────────────
+static void moveSelection(bool goLeft) {
   int next = childIndex(g_currentIndex, goLeft);
+  playElementTone(goLeft);
   if (hasNode(next)) {
     g_currentIndex = next;
     g_lastActionAt = millis();
-    showFlash(goLeft ? "Long -> left" : "Short -> right", true);
+    showFlash(goLeft ? "Dash" : "Dot", true);
   } else {
     showFlash("No branch", false);
   }
-  setLedForDepth();
+  M5.Power.setLed(g_currentIndex == 1 ? 0 : 1);
   renderUi();
 }
 
-void resetToRoot(const char* reason) {
+static void resetToRoot(const char* reason) {
   g_currentIndex = 1;
   g_lastActionAt = millis();
   showFlash(reason, true);
-  setLedForDepth();
+  M5.Power.setLed(0);
   renderUi();
 }
 
-void handleButton() {
+static void handleButton() {
   bool pressed = M5.BtnA.isPressed();
   uint32_t now = millis();
 
   if (pressed && !g_buttonDown) {
-    g_buttonDown = true;
-    g_buttonDownAt = now;
+    g_buttonDown    = true;
+    g_buttonDownAt  = now;
   } else if (!pressed && g_buttonDown) {
     uint32_t duration = now - g_buttonDownAt;
     g_buttonDown = false;
@@ -302,14 +364,13 @@ void handleButton() {
   }
 }
 
-void handleIdleReset() {
+static void handleIdleReset() {
   if (g_currentIndex != 1 && millis() - g_lastActionAt > kIdleResetMs) {
-    resetToRoot("Auto reset");
+    resetToRoot("Auto");
   }
 }
 
-}  // namespace
-
+// ── Arduino entry ──────────────────────────────────────────────────────
 void setup() {
   forceUsbReenumeration();
 
@@ -321,10 +382,24 @@ void setup() {
   cfg.serial_baudrate = 115200;
   M5.begin(cfg);
 
+  // Official HowToUse pattern: auto-rotate to landscape
+  if (M5.Display.width() < M5.Display.height()) {
+    M5.Display.setRotation(M5.Display.getRotation() ^ 1);
+  }
+
+  M5.Display.setTextSize(kTextSize);
+  M5.Speaker.setVolume(96);
+
+  Serial.printf("Board: %s  Rotation=%u  W=%d H=%d\n",
+                M5.getBoard() == m5::board_t::board_M5StickS3 ? "StickS3" : "?",
+                M5.Display.getRotation(),
+                M5.Display.width(),
+                M5.Display.height());
+
   buildTree();
   g_lastActionAt = millis();
   showFlash("Ready", true);
-  setLedForDepth();
+  M5.Power.setLed(0);
   renderUi();
 }
 
