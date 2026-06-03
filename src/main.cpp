@@ -382,10 +382,11 @@ void setup() {
   cfg.serial_baudrate = 115200;
   M5.begin(cfg);
 
-  // Official HowToUse pattern: auto-rotate to landscape
-  if (M5.Display.width() < M5.Display.height()) {
-    M5.Display.setRotation(M5.Display.getRotation() ^ 1);
-  }
+  // StickS3 correct orientation: rotation=0 gives portrait (135×240 panel,
+  // 128×128 visible lens centered within).  The official HowToUse auto-rotate
+  // to landscape is NOT right for this board — it causes the content to fill
+  // only half the visible area.
+  M5.Display.setRotation(0);
 
   M5.Display.setTextSize(kTextSize);
   M5.Speaker.setVolume(96);
