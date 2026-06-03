@@ -382,20 +382,34 @@ void setup() {
   cfg.serial_baudrate = 115200;
   M5.begin(cfg);
 
-  // StickS3 correct orientation: rotation=0 gives portrait (135×240 panel,
-  // 128×128 visible lens centered within).  The official HowToUse auto-rotate
-  // to landscape is NOT right for this board — it causes the content to fill
-  // only half the visible area.
-  M5.Display.setRotation(0);
-
-  M5.Display.setTextSize(kTextSize);
+  // StickS3: rotation=0 (portrait).  The M5GFX default panel config
+  // is 135×240 with offset (52,40).  On this hardware the visible lens
+  // is 128×128.  If content appears compressed into the upper half, the
+  // panel_height/offset_y values don't match the physical gate layout.
+  // Fix: set panel_height=128, offset_y=0 so user coordinates map 1:1
+  // to the visible lens.
+  {
+    auto pnl_cfg = M5.Display.panel()->config();
+    Serial.printf("Orig panel: %dx%d  ox=%d oy=%d  rot_off=%d\n",
+                  pnl_cfg.panel_width, pnl_cfg.panel_height,
+                  pnl_cfg.offset_x, pnl_cfg.offset_y,
+                  pnl_cfg.offset_rotation);
+    pnl_cfg.panel_height = 128;
+    pnl_cfg.offset_y = 0;
+    M5.Display.panel()->config(pnl_cfg);
+    M5.Display.setRotation(0);
+    Serial.printf("Fixed panel: %dx%d  ox=%d oy=%d\n",
+                  pnl_cfg.panel_width, pnl_cfg.panel_height,
+                  pnl_cfg.offset_x, pnl_cfg.offset_y);
+  }
   M5.Speaker.setVolume(96);
 
-  Serial.printf("Board: %s  Rotation=%u  W=%d H=%d\n",
+  int w = M5.Display.width();
+  int h = M5.Display.height();
+  Serial.printf("Board: %s  Rot=%u  W=%d H=%d\n",
                 M5.getBoard() == m5::board_t::board_M5StickS3 ? "StickS3" : "?",
-                M5.Display.getRotation(),
-                M5.Display.width(),
-                M5.Display.height());
+                M5.Display.getRotation(), w, h);
+
 
   buildTree();
   g_lastActionAt = millis();
